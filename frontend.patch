@@ -1,0 +1,413 @@
+--- a/src/lib/driveApi.js
++++ b/src/lib/driveApi.js
+@@ -155,6 +155,12 @@
+     expiry, can_download: !!canDownload, require_visitor_info: !!requireInfo, single_person: !!singlePerson, one_time: !!oneTime,
+     ...(oneTime && access ? { access } : {}), ...(password ? { password } : {}),
+   }).then(unwrap),
++  /** One link for several files / folders: POST /drive/shares/bundle. ids = My PC node ids, title = name the visitor sees (optional). */
++  createBundleShare: (ids, { title, expiry, canDownload, requireInfo, password, singlePerson, oneTime, access }) => api.post(`${B}/shares/bundle`, {
++    node_ids: ids, ...(title ? { title } : {}),
++    expiry, can_download: !!canDownload, require_visitor_info: !!requireInfo, single_person: !!singlePerson, one_time: !!oneTime,
++    ...(oneTime && access ? { access } : {}), ...(password ? { password } : {}),
++  }).then(unwrap),
+   /** patch: { expiry?, can_download?, require_visitor_info?, single_person?, one_time?, access? ('10m' | '2h' | '1d'), password?, remove_password? } */
+   updateShare: (shareId, patch) => api.patch(`${B}/shares/${shareId}`, patch).then(unwrap),
+   revokeShare: (shareId) => api.del(`${B}/shares/${shareId}`),
+--- a/src/components/ShareDialog.jsx
++++ b/src/components/ShareDialog.jsx
+@@ -1,4 +1,4 @@
+-import { useCallback, useEffect, useState } from 'react';
++import { useCallback, useEffect, useMemo, useState } from 'react';
+ import Icon from './Icon';
+ import { StModal, timeAgo } from './student/stUi';
+ import { errorMessage } from '../api/client';
+@@ -139,9 +139,18 @@
+   } catch { return false; }
+ }
+ 
+-/** "Share" dialog for a My PC file / folder: create, copy, edit and turn off public links. */
+-export default function ShareDialog({ node, ar, locale, onClose, onToast, onManage }) {
++/**
++ * "Share" dialog for My PC: one file / folder, or several of them in ONE link (`nodes` with 2+ items).
++ * A multi-item link opens for the visitor as a single folder that holds the selected items, in the order they see them in My PC.
++ */
++export default function ShareDialog({ nodes, node: nodeProp, ar, locale, onClose, onToast, onManage }) {
+   const tt = useCallback((en, a) => (ar ? a : en), [ar]);
++  const list = useMemo(() => (nodes && nodes.length ? nodes : [nodeProp]).filter(Boolean), [nodes, nodeProp]);
++  const multi = list.length > 1;
++  const node = list[0];
++  const defaultTitle = ar ? `${list.length} عناصر مشتركة` : `${list.length} shared items`;
++  const [groupName, setGroupName] = useState('');
++  const [createdIds, setCreatedIds] = useState([]); // links made from this dialog (a multi-item link has no per-node list to load)
+   const [links, setLinks] = useState(null);
+   const [expiry, setExpiry] = useState('7d');
+   const [customN, setCustomN] = useState('5');
+@@ -162,8 +171,14 @@
+   const [error, setError] = useState('');
+ 
+   const load = useCallback(async () => {
+-    try { setLinks((await drive.shares(node.id))?.items || []); } catch (e) { setError(errorMessage(e)); setLinks([]); }
+-  }, [node.id]);
++    try {
++      if (multi) {
++        if (!createdIds.length) { setLinks([]); return; }
++        const all = (await drive.mySharedLinks())?.items || [];
++        setLinks(all.filter((l) => createdIds.includes(l.id)));
++      } else setLinks((await drive.shares(node.id))?.items || []);
++    } catch (e) { setError(errorMessage(e)); setLinks([]); }
++  }, [node.id, multi, createdIds]);
+   useEffect(() => { load(); }, [load]);
+ 
+   const act = async (fn, okMsg) => {
+@@ -207,12 +222,30 @@
+     >
+       <div className="mp-share">
+         <div className="mp-share__file">
+-          <span className="mp-share__file-ico"><Icon name={isFolder ? 'folder' : 'file'} size={20} /></span>
++          <span className="mp-share__file-ico"><Icon name={isFolder || multi ? 'folder' : 'file'} size={20} /></span>
+           <div>
+-            <strong title={node.name}>{node.name}</strong>
++            <strong title={multi ? list.map((x) => x.name).join('\n') : node.name}>{multi ? tt(`${list.length} items in one link`, `${list.length} عناصر في رابط واحد`) : node.name}</strong>
+             <small>{tt('Anyone with the link can open it — no sign-in. Turn it off any time.', 'أي شخص معه الرابط يقدر يفتحه — من غير تسجيل دخول. وتقدر توقفه في أي وقت.')}</small>
+           </div>
+         </div>
++        {multi && (
++          <div className="mp-share__bundle">
++            <ul className="mp-share__bundle-list" aria-label={tt('Items in this link', 'العناصر داخل الرابط')}>
++              {list.slice(0, 6).map((x) => (
++                <li key={x.id} title={x.name}><Icon name={x.type === 'folder' ? 'folder' : 'file'} size={14} /><span>{x.name}</span></li>
++              ))}
++              {list.length > 6 && <li className="is-more">{tt(`+${list.length - 6} more`, `+${list.length - 6} عنصر كمان`)}</li>}
++            </ul>
++            <label className="mp-share__group mp-share__group--full">
++              <span className="mp-share__lbl">{tt('Name shown to the visitor (optional)', 'الاسم اللي هيظهر للمستلم (اختياري)')}</span>
++              <input
++                type="text" value={groupName} maxLength={120} disabled={busy} placeholder={defaultTitle}
++                onChange={(e) => setGroupName(e.target.value)} aria-label={tt('Link name', 'اسم الرابط')}
++              />
++            </label>
++            <small className="mp-share__hint">{tt('The visitor sees one organized folder with these items — folders open with everything inside.', 'المستلم هيشوف مجلد واحد منظم فيه العناصر دي — والمجلدات بتتفتح بكل اللي جواها.')}</small>
++          </div>
++        )}
+ 
+         <section className="mp-share__new">
+           <div className="mp-share__group">
+@@ -270,7 +303,11 @@
+             type="button" className="btn btn-primary mp-share__create" disabled={busy || !newExpiry || pwBad || (usePw && !pw) || (mode === 'once' && !access)}
+             title={newExpiry ? undefined : tt('Enter a whole number: 1 minute to 365 days', 'اكتب رقم صحيح: من دقيقة لـ 365 يوم')}
+             onClick={() => act(async () => {
+-              const l = await drive.createShare(node.id, { expiry: newExpiry, canDownload, requireInfo, password: usePw ? pw : '', singlePerson: mode === 'single', oneTime: mode === 'once', access: mode === 'once' ? access : undefined });
++              const opts = { expiry: newExpiry, canDownload, requireInfo, password: usePw ? pw : '', singlePerson: mode === 'single', oneTime: mode === 'once', access: mode === 'once' ? access : undefined };
++              const l = multi
++                ? await drive.createBundleShare(list.map((x) => x.id), { ...opts, title: groupName.trim() || defaultTitle })
++                : await drive.createShare(node.id, opts);
++              if (l?.id && multi) setCreatedIds((ids) => [...ids, l.id]);
+               if (l?.token) await copyText(shareUrl(l.token));
+               setPw(''); setUsePw(false); setShowPw(false);
+             }, usePw ? tt('Link created and copied — remember the password, it can’t be shown again.', 'تم إنشاء الرابط ونسخه — افتكر الباسورد، مش هيتعرض تاني.') : tt('Link created and copied.', 'تم إنشاء الرابط ونسخه.'))}
+@@ -286,12 +323,13 @@
+ 
+         <div className="mp-share__list">
+           {links === null && <div className="mp-share__empty">{tt('Loading…', 'جارِ التحميل…')}</div>}
+-          {links && links.length === 0 && <div className="mp-share__empty"><Icon name="link" size={20} /><span>{tt('No links yet — create one above.', 'مفيش روابط لسه — اعمل واحد من فوق.')}</span></div>}
++          {links && links.length === 0 && <div className="mp-share__empty"><Icon name="link" size={20} /><span>{multi ? tt('Create the link above — it will show up here.', 'اعمل الرابط من فوق — وهيظهر هنا.') : tt('No links yet — create one above.', 'مفيش روابط لسه — اعمل واحد من فوق.')}</span></div>}
+           {links && links.map((l) => (
+             <article key={l.id} className={`mp-share__row${l.expired ? ' is-expired' : ''}`}>
+               <div className="mp-share__top">
+                 <span className={`mp-badge ${l.paused ? 'is-warn' : l.expired ? 'is-off' : 'is-on'}`}>{l.paused ? tt('Paused', 'موقوف مؤقتًا') : l.expired ? tt('Expired', 'منتهي') : tt('Active', 'شغّال')}</span>
+                 <span className="mp-badge mp-badge--soft"><Icon name={l.can_download ? 'download' : 'eye'} size={11} />{l.can_download ? tt('Download allowed', 'التنزيل مسموح') : tt('View only', 'عرض فقط')}</span>
++                {l.is_bundle && <span className="mp-badge mp-badge--soft"><Icon name="folder" size={11} />{l.node?.count ?? ''} {tt('items', 'عناصر')}</span>}
+                 {l.has_password && <span className="mp-badge mp-badge--soft"><Icon name="lock" size={11} />{tt('Password', 'باسورد')}</span>}
+                 {l.require_visitor_info && <span className="mp-badge mp-badge--soft"><Icon name="users" size={11} />{tt('Visitor details', 'بيانات الزائر')}</span>}
+                 {l.one_time && <span className="mp-badge mp-badge--soft"><Icon name="clock" size={11} />{tt('One time', 'مرة واحدة')} · {accessText(l.access_minutes, ar)}</span>}
+--- a/src/components/MySharedLinks.jsx
++++ b/src/components/MySharedLinks.jsx
+@@ -447,10 +447,11 @@
+                 <label className="mp-sl__pick" title={tt('Select', 'تحديد')}>
+                   <input type="checkbox" checked={on} onChange={() => toggle(l.id)} disabled={busy} aria-label={tt('Select this link', 'تحديد الرابط ده')} />
+                 </label>
+-                <span className="mp-share__file-ico"><Icon name={l.node?.type === 'folder' ? 'folder' : 'file'} size={18} /></span>
++                <span className="mp-share__file-ico"><Icon name={l.node?.type === 'folder' || l.node?.type === 'bundle' ? 'folder' : 'file'} size={18} /></span>
+                 <div className="mp-sl__title">
+                   <strong title={l.node?.name}>{l.node_deleted ? tt('Deleted item', 'عنصر محذوف') : l.node?.name}</strong>
+                   <div className="mp-share__top">
++                    {l.is_bundle && !l.node_deleted && <span className="mp-badge mp-badge--soft"><Icon name="folder" size={11} />{l.node?.count ?? ''} {tt('items', 'عناصر')}</span>}
+                     {l.node_deleted && <span className="mp-badge is-off">{tt('Item deleted — link is dead', 'العنصر اتحذف — الرابط مات')}</span>}
+                     <span className="mp-badge mp-badge--soft"><Icon name={l.can_download ? 'download' : 'eye'} size={11} />{l.can_download ? tt('Download allowed', 'التنزيل مسموح') : tt('View only', 'عرض فقط')}</span>
+                     {l.has_password && <span className="mp-badge mp-badge--soft"><Icon name="lock" size={11} />{tt('Password', 'باسورد')}</span>}
+--- a/src/pages/student/StudentMyPC.jsx
++++ b/src/pages/student/StudentMyPC.jsx
+@@ -948,7 +948,7 @@
+     if (one && one.type === 'file' && extOf(one.name) === 'zip') out.push({ icon: 'archive', label: tt('Extract here', 'فك الضغط هنا'), run: () => extract(one) });
+     if (group.length) {
+       out.push({ icon: 'download', label: tt('Download', 'تنزيل'), run: () => group.forEach(download), disabled: group.length > 1 });
+-      if (one) out.push({ icon: 'share', label: tt('Share', 'مشاركة'), run: () => setDlg({ type: 'share', node: one }) });
++      out.push({ icon: 'share', label: group.length > 1 ? tt(`Share ${group.length} items in one link`, `مشاركة ${group.length} عناصر في رابط واحد`) : tt('Share', 'مشاركة'), run: () => setDlg({ type: 'share', nodes: group }) });
+       if (!inTrash) {
+         const allFav = group.every((x) => marks.isFav(x.id));
+         out.push({ icon: 'star', label: allFav ? tt('Remove from favorites', 'إزالة من المفضلة') : tt('Add to favorites', 'إضافة للمفضلة'), run: () => marks.setFav(group.map((x) => x.id), !allFav) });
+@@ -1074,7 +1074,7 @@
+             <button type="button" className="mp-ib" disabled={!selected.length} onClick={() => setClip({ ids: selected.map((n) => n.id), mode: 'cut' })} title={tt('Cut (Ctrl+X)', 'قص (Ctrl+X)')} aria-label={tt('Cut', 'قص')}><Icon name="ed-crop" size={16} /></button>
+             <button type="button" className="mp-ib" disabled={!clip} onClick={() => paste()} title={tt('Paste (Ctrl+V)', 'لصق (Ctrl+V)')} aria-label={tt('Paste', 'لصق')}><Icon name="file-plus" size={16} /></button>
+             <button type="button" className="mp-ib" disabled={selected.length !== 1} onClick={() => rename(selected[0])} title={tt('Rename (F2)', 'إعادة تسمية (F2)')} aria-label={tt('Rename', 'إعادة تسمية')}><Icon name="edit" size={16} /></button>
+-            <button type="button" className="mp-ib" disabled={selected.length !== 1} onClick={() => setDlg({ type: 'share', node: selected[0] })} title={tt('Share', 'مشاركة')} aria-label={tt('Share', 'مشاركة')}><Icon name="share" size={16} /></button>
++            <button type="button" className="mp-ib" disabled={!selected.length} onClick={() => setDlg({ type: 'share', nodes: selected })} title={selected.length > 1 ? tt('Share the selected items in one link', 'مشاركة المحدد في رابط واحد') : tt('Share', 'مشاركة')} aria-label={tt('Share', 'مشاركة')}><Icon name="share" size={16} /></button>
+             <button type="button" className="mp-ib" disabled={!selected.length} onClick={() => zipSelected(selected)} title={tt('Compress to ZIP', 'ضغط إلى ZIP')} aria-label={tt('Compress to ZIP', 'ضغط إلى ZIP')}><Icon name="archive" size={16} /></button>
+             <button type="button" className="mp-ib mp-danger" disabled={!selected.length} onClick={() => doDelete(selected)} title={tt('Delete (Del)', 'حذف (Del)')} aria-label={tt('Delete', 'حذف')}><Icon name="trash" size={16} /></button>
+           </>
+@@ -1317,7 +1317,7 @@
+           onRestored={() => { reload({ quiet: true }); window.dispatchEvent(new Event('uip-drive-changed')); }} />
+       )}
+       {dlg?.type === 'storage' && <StorageDialog ar={ar} locale={locale} onClose={() => setDlg(null)} onOpenFolder={openFolder} />}
+-      {dlg?.type === 'share' && <ShareDialog node={dlg.node} ar={ar} locale={locale} onClose={() => setDlg(null)} onToast={flash} onManage={() => setDlg({ type: 'mylinks' })} />}
++      {dlg?.type === 'share' && <ShareDialog nodes={dlg.nodes || [dlg.node]} ar={ar} locale={locale} onClose={() => setDlg(null)} onToast={flash} onManage={() => setDlg({ type: 'mylinks' })} />}
+       {dlg?.type === 'mylinks' && <MySharedLinks ar={ar} locale={locale} onClose={() => setDlg(null)} onToast={flash} />}
+       {dlg?.type === 'name' && <NameDialog dlg={dlg} tt={tt} onClose={() => setDlg(null)} />}
+       {dlg?.type === 'tags' && <TagsDialog node={dlg.node} marks={marks} tt={tt} onClose={() => setDlg(null)} />}
+--- a/src/styles/css/drive-share-dialogs.css
++++ b/src/styles/css/drive-share-dialogs.css
+@@ -338,3 +338,12 @@
+ 
+ @keyframes shd-sheet { from { transform: translateY(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+ @media (prefers-reduced-motion: reduce) { .st-modal:has(.mp-share), .st-modal:has(.mp-sl) { animation: none !important; } }
++
++/* ---- one link for several items (ShareDialog with 2+ nodes) ---- */
++.mp-share__bundle { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
++.mp-share__bundle-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
++.mp-share__bundle-list li { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 5px 10px; border-radius: 999px; font-size: 12.5px; background: rgba(var(--color-primary-rgb), .07); border: 1px solid rgba(var(--color-primary-rgb), .14); color: var(--text-primary); }
++.mp-share__bundle-list li span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
++.mp-share__bundle-list li.is-more { background: transparent; border-style: dashed; color: var(--text-secondary); }
++.mp-share__bundle input[type="text"] { width: 100%; }
++.mp-share__hint { font-size: 12px; line-height: 1.5; color: var(--text-secondary); }
+--- a/src/pages/SharedItem.jsx
++++ b/src/pages/SharedItem.jsx
+@@ -241,6 +241,10 @@
+   const [err, setErr] = useState(null);
+   const [loading, setLoading] = useState(true);
+   const [busy, setBusy] = useState(false);
++  const [viewOpen, setViewOpen] = useState(true);   // the file viewer can be folded away so the page stays short
++  const [listOpen, setListOpen] = useState(true);   // ... and so can the list of items
++  const [viewMode, setViewMode] = useState('list'); // list | grid
++  const [q, setQ] = useState('');                   // filter box (shown once there are many items)
+   const [preview, setPreview] = useState(null); // { id, name, kind, blob?, url?, text?, loading?, failed? }
+   const [locked, setLocked] = useState(false);
+   const [gate, setGate] = useState(null); // { needs_password, needs_info, owner_name } while the owner's gate is not passed
+@@ -312,9 +316,14 @@
+   const share = data?.share;
+   const canDl = !!share?.can_download;
+   const isFolder = node?.type === 'folder';
++  const items = data?.items || [];
++  const shown = q.trim() ? items.filter((it) => it.name.toLowerCase().includes(q.trim().toLowerCase())) : items;
++  const nFolders = items.filter((it) => it.type === 'folder').length;
++  const nFiles = items.length - nFolders;
+ 
+   const openPreview = useCallback(async (file) => {
+     clearPreview();
++    setViewOpen(true);
+     const kind = kindOfName(file.name);
+     const media = kind === 'video' || kind === 'audio';
+     if (kind === 'none') { setPreview({ id: file.id, name: file.name, none: true }); return; }
+@@ -330,7 +339,7 @@
+     if (node && node.type === 'file' && nodeId === null) openPreview(node);
+   }, [node?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+ 
+-  const go = (id) => { clearPreview(); setNodeId(id && id !== share?.root?.id ? id : null); };
++  const go = (id) => { clearPreview(); setQ(''); setNodeId(id && id !== share?.root?.id ? id : null); };
+ 
+   const download = async (file) => {
+     setBusy(true);
+@@ -417,7 +426,7 @@
+                 <div className="shp__chips">
+                   {!isFolder && node.size_human && <span className="shp__chip">{node.size_human}</span>}
+                   {share.expires_at && <span className="shp__chip"><Icon name="clock" size={12} />{t('Available until ', 'متاح لحد ')}{fmtDate(share.expires_at)}</span>}
+-                  {isFolder && <span className="shp__chip">{data.items.length} {t('items', 'عنصر')}</span>}
++                  {isFolder && <span className="shp__chip">{items.length} {t('items', 'عنصر')}{nFolders > 0 && nFiles > 0 ? ` · ${nFolders} ${t('folders', 'مجلد')} · ${nFiles} ${t('files', 'ملف')}` : ''}</span>}
+                   {canDl
+                     ? <span className="shp__chip shp__chip--ok"><Icon name="download" size={12} />{t('Download allowed', 'التنزيل متاح')}</span>
+                     : <span className="shp__chip shp__chip--lock"><Icon name="eye" size={12} />{t('View only', 'عرض فقط')}</span>}
+@@ -434,48 +443,75 @@
+             </section>
+ 
+             {isFolder && (
+-              <section className="shp__card">
+-                <nav className="shp__crumbs" aria-label={t('Path', 'المسار')}>
+-                  {data.breadcrumb.map((c, i) => (
+-                    <span key={c.id}>
+-                      {i > 0 && <span aria-hidden="true"> / </span>}
+-                      <button type="button" disabled={i === data.breadcrumb.length - 1} onClick={() => go(c.id)}>{c.name}</button>
+-                    </span>
+-                  ))}
+-                </nav>
+-                {data.items.length === 0 ? <p className="shp__note">{t('This folder is empty.', 'المجلد فاضي.')}</p> : (
+-                  <ul className="shp__list">
+-                    {data.items.map((it) => (
++              <section className="shp__card shp__browser">
++                <div className="shp__bar">
++                  <nav className="shp__crumbs" aria-label={t('Path', 'المسار')}>
++                    {data.breadcrumb.map((c, i) => (
++                      <span key={c.id}>
++                        {i > 0 && <span aria-hidden="true"> / </span>}
++                        <button type="button" disabled={i === data.breadcrumb.length - 1} onClick={() => go(c.id)}>{c.name}</button>
++                      </span>
++                    ))}
++                  </nav>
++                  <div className="shp__bar-tools">
++                    {listOpen && items.length > 6 && (
++                      <label className="shp__find">
++                        <Icon name="search" size={14} />
++                        <input type="search" value={q} onChange={(e) => setQ(e.target.value)} placeholder={t('Filter…', 'بحث في العناصر…')} aria-label={t('Filter items', 'بحث في العناصر')} />
++                      </label>
++                    )}
++                    {listOpen && items.length > 0 && (
++                      <div className="shp__seg" role="group" aria-label={t('View', 'طريقة العرض')}>
++                        <button type="button" className={viewMode === 'list' ? 'is-on' : ''} aria-pressed={viewMode === 'list'} onClick={() => setViewMode('list')} title={t('List', 'قائمة')}>
++                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" /></svg>
++                        </button>
++                        <button type="button" className={viewMode === 'grid' ? 'is-on' : ''} aria-pressed={viewMode === 'grid'} onClick={() => setViewMode('grid')} title={t('Grid', 'شبكة')}>
++                          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" /><rect x="14" y="14" width="7" height="7" rx="1.5" /></svg>
++                        </button>
++                      </div>
++                    )}
++                    <button type="button" className="shp__fold" aria-expanded={listOpen} onClick={() => setListOpen((v) => !v)}>
++                      <Icon name={listOpen ? 'chevron-up' : 'chevron-down'} size={14} />
++                      <span>{listOpen ? t('Hide list', 'إخفاء القائمة') : t('Show list', 'إظهار القائمة')}</span>
++                    </button>
++                  </div>
++                </div>
++                {listOpen && (items.length === 0 ? <p className="shp__note">{t('This folder is empty.', 'المجلد فاضي.')}</p> : shown.length === 0 ? <p className="shp__note">{t('No matches.', 'مفيش نتائج.')}</p> : (
++                  <ul className={`shp__list${viewMode === 'grid' ? ' shp__list--grid' : ''}`}>
++                    {shown.map((it) => (
+                       <li key={it.id}>
+                         <button type="button" className={`shp__item${preview?.id === it.id ? ' is-on' : ''}`} onClick={() => (it.type === 'folder' ? go(it.id) : openPreview(it))}>
+-                          {it.type === 'folder' ? <FolderGlyph size={28} /> : <FileGlyph size={28} label={it.extension} />}
++                          {it.type === 'folder' ? <FolderGlyph size={viewMode === 'grid' ? 44 : 28} /> : <FileGlyph size={viewMode === 'grid' ? 44 : 28} label={it.extension} />}
+                           <span className="shp__item-name">{it.name}</span>
+                           {it.type === 'file' && <span className="shp__item-size">{it.size_human}</span>}
+                         </button>
+                       </li>
+                     ))}
+                   </ul>
+-                )}
++                ))}
+               </section>
+             )}
+ 
+             {preview && (
+-              <section className="shp__card shp__viewer">
+-                {isFolder && (
+-                  <div className="shp__head">
+-                    <strong className="shp__vtitle">{preview.name}</strong>
+-                    <div className="shp__actions">
+-                      {canDl && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => download({ id: preview.id, name: preview.name })}><Icon name="download" size={14} /><span>{t('Download', 'تنزيل')}</span></button>}
+-                      <button type="button" className="btn btn-ghost" onClick={clearPreview}><Icon name="x" size={14} /><span>{t('Close', 'إغلاق')}</span></button>
+-                    </div>
++              <section className={`shp__card shp__viewer${viewOpen ? '' : ' is-folded'}`}>
++                <div className="shp__head">
++                  <strong className="shp__vtitle" title={preview.name}>{preview.name}</strong>
++                  <div className="shp__actions">
++                    <button type="button" className="btn btn-ghost" aria-expanded={viewOpen} onClick={() => setViewOpen((v) => !v)}>
++                      <Icon name={viewOpen ? 'chevron-up' : 'chevron-down'} size={14} /><span>{viewOpen ? t('Hide preview', 'إخفاء العرض') : t('Show preview', 'إظهار العرض')}</span>
++                    </button>
++                    {isFolder && canDl && <button type="button" className="btn btn-ghost" disabled={busy} onClick={() => download({ id: preview.id, name: preview.name })}><Icon name="download" size={14} /><span>{t('Download', 'تنزيل')}</span></button>}
++                    {isFolder && <button type="button" className="btn btn-ghost" onClick={clearPreview}><Icon name="x" size={14} /><span>{t('Close', 'إغلاق')}</span></button>}
++                  </div>
++                </div>
++                <div className="shp__viewer-body" hidden={!viewOpen}>
++                  <div className={`shp__preview${preview.blob ? " has-file" : ""}`} style={wmStyle}>
++                    {preview.loading && <span className="lp2-spinner" aria-hidden="true" />}
++                    {preview.failed && <p className="shp__note">{t('Could not load the preview.', 'تعذّر تحميل المعاينة.')}</p>}
++                    {preview.big && <p className="shp__note">{canDl ? t('This file is too large to preview — download it to open it.', 'الملف كبير على المعاينة — نزّله عشان تفتحه.') : t('This file is too large to preview.', 'الملف كبير على المعاينة.')}</p>}
++                    {preview.none && <p className="shp__note">{canDl ? t('No preview for this file type — download it to open it.', 'مفيش معاينة لنوع الملف ده — نزّله عشان تفتحه.') : t('No preview is available for this file type.', 'مفيش معاينة متاحة لنوع الملف ده.')}</p>}
++                    {preview.blob && <ProtectedFile key={preview.id} name={preview.name} blob={preview.blob} mark={mark} tt={t} rtl={ar} onFail={() => setPreview((p) => p && { ...p, blob: null, failed: true })} />}
+                   </div>
+-                )}
+-                <div className={`shp__preview${preview.blob ? " has-file" : ""}`} style={wmStyle}>
+-                  {preview.loading && <span className="lp2-spinner" aria-hidden="true" />}
+-                  {preview.failed && <p className="shp__note">{t('Could not load the preview.', 'تعذّر تحميل المعاينة.')}</p>}
+-                  {preview.big && <p className="shp__note">{canDl ? t('This file is too large to preview — download it to open it.', 'الملف كبير على المعاينة — نزّله عشان تفتحه.') : t('This file is too large to preview.', 'الملف كبير على المعاينة.')}</p>}
+-                  {preview.none && <p className="shp__note">{canDl ? t('No preview for this file type — download it to open it.', 'مفيش معاينة لنوع الملف ده — نزّله عشان تفتحه.') : t('No preview is available for this file type.', 'مفيش معاينة متاحة لنوع الملف ده.')}</p>}
+-                  {preview.blob && <ProtectedFile key={preview.id} name={preview.name} blob={preview.blob} mark={mark} tt={t} rtl={ar} onFail={() => setPreview((p) => p && { ...p, blob: null, failed: true })} />}
+                 </div>
+               </section>
+             )}
+--- a/src/styles/css/drive-share-fix.css
++++ b/src/styles/css/drive-share-fix.css
+@@ -139,3 +139,25 @@
+ .shp .shp-code__bar select { width: auto; }
+ @media (min-width: 761px) { .shp-zip__pane > .shp-zip__crumb { display: none; } }
+ @media (max-width: 560px) { .shp .shp-code__bar > span { display: none; } .shp .shp-code__bar > strong { max-width: 38%; } }
++
++/* ---- foldable viewer + organized item list (public share page) ---- */
++.shp__viewer-body[hidden] { display: none !important; }
++.shp__viewer.is-folded { padding-bottom: 8px; }
++.shp__viewer.is-folded .shp__head { margin-bottom: 0; }
++.shp__viewer .shp__head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
++.shp__viewer .shp__head .shp__actions { width: auto; display: flex; gap: 6px; flex-wrap: wrap; }
++.shp__vtitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 160px; }
++.shp__bar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; margin-bottom: 12px; }
++.shp__bar .shp__crumbs { margin-bottom: 0; flex: 1 1 220px; min-width: 0; }
++.shp__bar-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
++.shp__find { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; height: 34px; border-radius: 10px; border: 1px solid var(--shp-line, var(--border-subtle)); background: var(--bg-canvas); color: var(--text-secondary); }
++.shp__find input { border: 0; outline: 0; background: transparent; color: var(--text-primary); width: 130px; font: inherit; font-size: 13px; }
++.shp__seg { display: inline-flex; border-radius: 10px; overflow: hidden; border: 1px solid var(--shp-line, var(--border-subtle)); }
++.shp__seg button { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 32px; border: 0; background: var(--bg-canvas); color: var(--text-secondary); cursor: pointer; }
++.shp__seg button.is-on { background: rgba(var(--color-primary-rgb), .14); color: var(--color-primary); }
++.shp__fold { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--shp-line, var(--border-subtle)); background: var(--bg-canvas); color: var(--text-primary); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
++.shp__fold:hover, .shp__seg button:not(.is-on):hover { background: rgba(var(--color-primary-rgb), .09); }
++.shp__list--grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
++.shp__list--grid > li .shp__item, .shp__list--grid > li + li .shp__item { flex-direction: column; justify-content: center; text-align: center; gap: 8px; min-height: 128px; padding: 14px 10px; border: 1px solid var(--shp-line, var(--border-subtle)); border-radius: 14px; width: 100%; }
++.shp__list--grid .shp__item-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; font-size: 13px; }
++@media (max-width: 520px) { .shp__fold span { display: none; } .shp__find input { width: 90px; } .shp__list--grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+--- a/src/components/shared/ProtectedFile.jsx
++++ b/src/components/shared/ProtectedFile.jsx
+@@ -95,6 +95,17 @@
+ 
+ /** Read-only code view: the platform's CodeMirror (highlighting, folding, line numbers, search) with a theme picker. */
+ /** Theme picker as a real menu (the browser's own <select> popup cannot be styled and has the default scrollbar). */
++/** Tiny preview of a theme: its editor background with three "code lines" in its keyword / string / function colours. */
++function ThemeSwatch({ th }) {
++  return (
++    <span className="shp-swatch" aria-hidden="true" style={{ background: th.ed.bg, borderColor: th.ui.line }}>
++      <i style={{ background: th.ed.keyword, width: '46%' }} />
++      <i style={{ background: th.ed.string, width: '72%' }} />
++      <i style={{ background: th.ed.fn, width: '58%' }} />
++    </span>
++  );
++}
++
+ function ThemeMenu({ value, onChange, label }) {
+   const [open, setOpen] = useState(false);
+   const [pos, setPos] = useState(null);
+@@ -127,14 +138,14 @@
+   return (
+     <>
+       <button ref={btn} type="button" className={`shp-theme${open ? ' is-open' : ''}`} aria-haspopup="listbox" aria-expanded={open} aria-label={label} onClick={() => setOpen((o) => !o)}>
+-        <span>{cur.name}</span><Icon name="chevron-down" size={13} />
++        <ThemeSwatch th={cur} /><span>{cur.name}</span><Icon name="chevron-down" size={13} />
+       </button>
+       {open && pos && createPortal(
+         <div ref={list} className="shp-theme__menu" role="listbox" aria-label={label} dir="ltr"
+           style={{ ...themeVars(value), position: 'fixed', left: pos.left, top: pos.top, bottom: pos.bottom, width: pos.width, maxHeight: pos.maxH }}>
+           {THEMES.map((th) => (
+-            <button key={th.id} type="button" role="option" aria-selected={th.id === value} className={th.id === value ? 'is-on' : ''} onClick={() => { onChange(th.id); setOpen(false); }}>
+-              <span>{th.name}</span>{th.id === value && <Icon name="check" size={14} />}
++            <button key={th.id} type="button" role="option" title={th.hint} aria-selected={th.id === value} className={th.id === value ? 'is-on' : ''} onClick={() => { onChange(th.id); setOpen(false); }}>
++              <ThemeSwatch th={th} /><span className="shp-theme__name">{th.name}</span>{th.id === value && <Icon name="check" size={14} />}
+             </button>
+           ))}
+         </div>, document.body)}
+--- a/src/styles/css/theme-menu.css
++++ b/src/styles/css/theme-menu.css
+@@ -22,3 +22,12 @@
+ .shp-theme__menu::-webkit-scrollbar-thumb { background: var(--zb-line); border: 2px solid transparent; background-clip: content-box; border-radius: 8px; }
+ .shp-theme__menu::-webkit-scrollbar-thumb:hover { background: var(--zb-muted); background-clip: content-box; }
+ @keyframes shpThemeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
++
++/* theme preview chip: editor background + three coloured "code lines" */
++.shp-swatch { flex: 0 0 auto; display: inline-flex; flex-direction: column; justify-content: center; gap: 3px; width: 30px; height: 22px; padding: 0 5px; border-radius: 6px; border: 1px solid; box-sizing: border-box; box-shadow: 0 1px 2px rgba(0, 0, 0, .12); }
++.shp-swatch i { display: block; height: 3px; border-radius: 2px; }
++.shp-theme { gap: 8px; }
++.shp-theme .shp-swatch { width: 24px; height: 18px; padding: 0 4px; gap: 2px; }
++.shp-theme .shp-swatch i { height: 2.5px; }
++.shp-theme__menu button { display: flex; align-items: center; gap: 10px; }
++.shp-theme__menu .shp-theme__name { flex: 1; text-align: start; }
